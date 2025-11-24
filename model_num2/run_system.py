@@ -61,6 +61,45 @@ def run_preprocessing(data_dir, labeled=True):
         logging.error(f"전처리 중 오류 발생: {e}")
         return False
 
+def check_and_update_preprocessing():
+    """이미지 폴더와 CSV 동기화 확인 및 자동 갱신"""
+    from pathlib import Path
+    import os
+    
+    image_folder = Path('data/train_images')
+    csv_file = Path('data/pose_data.csv')
+    
+    # 이미지 파일 개수 확인
+    image_count = 0
+    if image_folder.exists():
+        for subfolder in ['normal', 'abnormal']:
+            subfolder_path = image_folder / subfolder
+            if subfolder_path.exists():
+                image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+                for ext in image_extensions:
+                    image_count += len(list(subfolder_path.glob(ext)))
+                    image_count += len(list(subfolder_path.glob(ext.upper())))
+    
+    # CSV 파일 라인 수 확인
+    csv_count = 0
+    if csv_file.exists():
+        with open(csv_file, 'r', encoding='utf-8-sig') as f:
+            csv_count = sum(1 for line in f) - 1  # 헤더 제외
+    
+    logging.info(f"이미지 폴더: {image_count}개, CSV 데이터: {csv_count}개")
+    
+    # 불일치 또는 CSV 없으면 전처리 실행
+    if not csv_file.exists() or image_count != csv_count:
+        logging.warning(f"데이터 불일치 감지! 자동으로 전처리를 실행합니다...")
+        if run_preprocessing(image_folder, labeled=True):
+            logging.info("전처리 완료. 훈련을 계속합니다.")
+            return True
+        else:
+            logging.error("전처리 실패")
+            return False
+    
+    return True
+
 def run_training():
     """2단계: CNN+LSTM 모델 훈련"""
     logging.info("=== 2단계: CNN+LSTM 모델 훈련 시작 ===")
@@ -69,6 +108,10 @@ def run_training():
     
     # 모델 저장 폴더 생성
     Path('models').mkdir(exist_ok=True)
+    
+    # 이미지와 CSV 동기화 확인 및 자동 갱신
+    if not check_and_update_preprocessing():
+        return False
     
     # CNN+LSTM 모델 초기화
     cnn_lstm_model = CNNLSTMModel(
@@ -114,23 +157,27 @@ def run_training():
         history = cnn_lstm_model.train(
             X_img_train, X_num_train, y_train,
             X_img_val, X_num_val, y_val,
-            epochs=80,
+            epochs=10,
             batch_size=4
         )
         
+        # 훈련 히스토리 그래프 생성
+        logging.info("훈련 히스토리 그래프 생성 중...")
+        cnn_lstm_model.plot_training_history(history)
+        
         # 모델 평가
         logging.info("훈련 세트 평가 중...")
-        train_accuracy, _, _ = cnn_lstm_model.evaluate(
+        train_accuracy, _, _, _ = cnn_lstm_model.evaluate(
             X_img_train, X_num_train, y_train, dataset_name="Train"
         )
         
         logging.info("검증 세트 평가 중...")
-        val_accuracy, _, _ = cnn_lstm_model.evaluate(
+        val_accuracy, _, _, _ = cnn_lstm_model.evaluate(
             X_img_val, X_num_val, y_val, dataset_name="Validation"
         )
         
         logging.info("테스트 세트 평가 중...")
-        test_accuracy, _, _ = cnn_lstm_model.evaluate(
+        test_accuracy, _, _, _ = cnn_lstm_model.evaluate(
             X_img_test, X_num_test, y_test, dataset_name="Test"
         )
         
