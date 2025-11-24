@@ -111,7 +111,7 @@ goto individual
 :advanced_train
 echo.
 echo 🧠 고급 모델 훈련 실행 중...
-.\.venv\Scripts\python.exe src/lstm_model.py --data data/pose_data.csv --epochs 100 --batch_size 32
+.\.venv\Scripts\python.exe src/cnn_lstm_model.py --data data/pose_data.csv --images data/train_images --epochs 100 --batch_size 32
 pause
 goto individual
 
@@ -125,7 +125,7 @@ goto individual
 :quick_train
 echo.
 echo ⚡ 빠른 테스트 훈련 (10 에폭)
-.\.venv\Scripts\python.exe src/lstm_model.py --data data/pose_data.csv --epochs 10 --batch_size 16
+.\.venv\Scripts\python.exe src/cnn_lstm_model.py --data data/pose_data.csv --images data/train_images --epochs 10 --batch_size 16
 pause
 goto individual
 

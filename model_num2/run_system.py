@@ -95,7 +95,7 @@ def run_training():
         (X_img_train, X_num_train, y_train,
          X_img_val, X_num_val, y_val,
          X_img_test, X_num_test, y_test) = cnn_lstm_model.prepare_data(
-            df, image_dir, augment=True
+            df, image_dir, augment=True, save_split=False
         )
         
         if len(X_img_train) == 0:
