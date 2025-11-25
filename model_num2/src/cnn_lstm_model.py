@@ -37,7 +37,7 @@ class CNNLSTMModel:
     """CNN + LSTM 하이브리드 자세 분류 모델"""
     
     def __init__(self, csv_path=None, image_dir=None, model_name='cnn_lstm',
-                 img_height=128, img_width=128, sequence_length=5, dropout_rate=0.4):
+                 img_height=112, img_width=112, sequence_length=5, dropout_rate=0.35):
         """
         Args:
             csv_path (str): CSV 파일 경로 (optional)
@@ -473,8 +473,8 @@ class CNNLSTMModel:
             # 클래스 분포 확인
             unique, counts = np.unique(y_train, return_counts=True)
             if len(unique) > 0:
-                # 모든 클래스 2배 증강
-                aug_factor = 2
+                # 모든 클래스 1배 증강 (과적합 방지)
+                aug_factor = 1
                 
                 logging.info(
                     f"모든 클래스를 {aug_factor}배 증강합니다."
@@ -487,8 +487,8 @@ class CNNLSTMModel:
                     target_class=None
                 )
             else:
-                # 클래스가 1개만 있어도 2배 증강
-                aug_factor = 2
+                # 클래스가 1개만 있어도 1배 증강
+                aug_factor = 1
                 logging.info(f"단일 클래스를 {aug_factor}배 증강합니다.")
                 X_img_train, X_num_train, y_train = self.augment_data(
                     X_img_train, X_num_train, y_train, 
@@ -575,16 +575,16 @@ LSTM 블록 생성 헬퍼
             name='image_input'
         )
         
-        # CNN 블록
+        # CNN 블록 (균형잡힌 용량: 3개)
         x = self._build_cnn_block(image_input, 32, 'cnn1')
         x = self._build_cnn_block(x, 64, 'cnn2')
-        x = self._build_cnn_block(x, 128, 'cnn3')
+        x = self._build_cnn_block(x, 80, 'cnn3')
         x = TimeDistributed(GlobalAveragePooling2D(name='gap'))(x)
         
-        # LSTM 블록
-        x = self._build_lstm_block(x, 64, True, 'img_lstm1')
-        x = self._build_lstm_block(x, 32, False, 'img_lstm2')
-        image_features = Dense(32, activation='relu', kernel_regularizer=l2(0.001), 
+        # LSTM 블록 (균형잡힌 용량)
+        x = self._build_lstm_block(x, 56, True, 'img_lstm1')
+        x = self._build_lstm_block(x, 28, False, 'img_lstm2')
+        image_features = Dense(28, activation='relu', kernel_regularizer=l2(0.0007), 
                               name='image_features')(x)
         
         # 수치 브랜치
@@ -593,19 +593,19 @@ LSTM 블록 생성 헬퍼
             name='numeric_input'
         )
         
-        y = self._build_lstm_block(numeric_input, 32, True, 'num_lstm1')
-        y = self._build_lstm_block(y, 16, False, 'num_lstm2')
-        numeric_features = Dense(16, activation='relu', kernel_regularizer=l2(0.001),
+        y = self._build_lstm_block(numeric_input, 28, True, 'num_lstm1')
+        y = self._build_lstm_block(y, 14, False, 'num_lstm2')
+        numeric_features = Dense(14, activation='relu', kernel_regularizer=l2(0.0007),
                                 name='numeric_features')(y)
         
-        # 융합 브랜치
+        # 융합 브랜치 (균형잡힌 용량)
         merged = concatenate([image_features, numeric_features], name='fusion')
         
-        z = Dense(32, activation='relu', kernel_regularizer=l2(0.001))(merged)
+        z = Dense(28, activation='relu', kernel_regularizer=l2(0.0007))(merged)
         z = BatchNormalization(momentum=0.8)(z)
         z = Dropout(self.dropout_rate)(z)
-        z = Dense(16, activation='relu', kernel_regularizer=l2(0.001))(z)
-        z = Dropout(self.dropout_rate * 0.7)(z)  # 두 번째 dropout 약간 감소
+        z = Dense(14, activation='relu', kernel_regularizer=l2(0.0007))(z)
+        z = Dropout(self.dropout_rate * 0.8)(z)
         
         output = Dense(num_classes, activation='softmax', name='output')(z)
         
@@ -617,7 +617,7 @@ LSTM 블록 생성 헬퍼
         )
         
         self.model.compile(
-            optimizer=Adam(learning_rate=0.001, clipnorm=1.0),  # 학습률 0.001로 증가
+            optimizer=Adam(learning_rate=0.001, clipnorm=1.0),  # 학습률 균형 조정
             loss='sparse_categorical_crossentropy',
             metrics=['accuracy']
         )
@@ -651,8 +651,8 @@ LSTM 블록 생성 헬퍼
             y=y_train
         )
         
-        # 극단적인 가중치 제한 (0.5 ~ 3.0 범위)
-        class_weights = np.clip(class_weights, 0.5, 3.0)
+        # 가중치 범위 균형 조정 (0.6 ~ 2.5)
+        class_weights = np.clip(class_weights, 0.6, 2.5)
         class_weight_dict = dict(enumerate(class_weights))
         
         logging.info(f"클래스 가중치: {class_weight_dict}")
@@ -660,17 +660,17 @@ LSTM 블록 생성 헬퍼
         callbacks = [
             EarlyStopping(
                 monitor='val_loss', 
-                patience=25,  # patience 증가 (안정성 향상)
+                patience=18,  # patience 적절히 조정
                 restore_best_weights=True,
-                min_delta=0.001,  # 최소 개선 임계값 추가
+                min_delta=0.001,  # 임계값 적절히
                 verbose=1
             ),
             ReduceLROnPlateau(
                 monitor='val_loss', 
-                factor=0.6,  # 학습률 감소 속도 완화
-                patience=10,  # patience 증가
+                factor=0.6,
+                patience=7,
                 min_lr=1e-7,
-                min_delta=0.001,  # 최소 개선 임계값 추가
+                min_delta=0.001,
                 verbose=1
             ),
             ModelCheckpoint(
@@ -958,12 +958,12 @@ def main():
                        help='훈련 데이터 CSV 파일 경로')
     parser.add_argument('--images', default='data/train_images',
                        help='이미지 폴더 경로')
-    parser.add_argument('--epochs', type=int, default=30,
-                       help='훈련 에폭 수')
-    parser.add_argument('--batch_size', type=int, default=8,
-                       help='배치 크기')
-    parser.add_argument('--img_size', type=int, default=128,
-                       help='이미지 크기 (정사각형)')
+    parser.add_argument('--epochs', type=int, default=35,
+                       help='훈련 에폭 수 (기본: 35, 빠른 테스트: 20)')
+    parser.add_argument('--batch_size', type=int, default=14,
+                       help='배치 크기 (기본: 14, GPU 메모리 부족 시 10으로 감소)')
+    parser.add_argument('--img_size', type=int, default=112,
+                       help='이미지 크기 (기본: 112, 고성능: 128, 경량: 96)')
     parser.add_argument('--sequence_length', type=int, default=5,
                        help='LSTM 시퀀스 길이')
     parser.add_argument('--no_augment', action='store_true',

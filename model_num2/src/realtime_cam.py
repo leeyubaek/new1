@@ -37,7 +37,9 @@ class RealtimePostureMonitor:
         self.model = None
         self.scaler = None
         self.label_encoder = None
-        self.sequence_length = 10
+        self.sequence_length = 5  # 기본값, 메타데이터에서 덮어씀
+        self.img_height = 128
+        self.img_width = 128
         self.feature_columns = None
         
         if Path(model_path).exists():
@@ -47,6 +49,7 @@ class RealtimePostureMonitor:
         
         # 데이터 버퍼 (시퀀스용)
         self.pose_buffer = deque(maxlen=self.sequence_length)
+        self.image_buffer = deque(maxlen=self.sequence_length)
         
         # 예측 결과 저장
         self.predictions = deque(maxlen=30)  # 30프레임 평균
@@ -88,9 +91,11 @@ class RealtimePostureMonitor:
                 metadata = json.load(f)
             
             self.sequence_length = metadata['sequence_length']
+            self.img_height = metadata.get('img_height', 128)
+            self.img_width = metadata.get('img_width', 128)
             self.feature_columns = metadata['feature_columns']
             
-            logging.info("모델 로드 완료")
+            logging.info(f"모델 로드 완료 (sequence_length={self.sequence_length})")
             
         except Exception as e:
             logging.error(f"모델 로드 실패: {e}")
@@ -183,9 +188,9 @@ class RealtimePostureMonitor:
         
         return angles
     
-    def predict_posture(self, pose_data: dict) -> dict:
-        """자세 예측"""
-        if self.model is None or not pose_data:
+    def predict_posture(self, pose_data: dict, frame: np.ndarray) -> dict:
+        """자세 예측 (이미지 + 수치 데이터)"""
+        if self.model is None or not pose_data or frame is None:
             return {'predicted_class': 'unknown', 'confidence': 0.0}
         
         try:
@@ -199,20 +204,34 @@ class RealtimePostureMonitor:
             
             feature_vector = np.array(feature_vector).reshape(1, -1)
             
+            # 이미지 전처리
+            img_resized = cv2.resize(frame, (self.img_width, self.img_height), 
+                                    interpolation=cv2.INTER_AREA)
+            img_normalized = img_resized.astype(np.float32) / 255.0
+            
             # 버퍼에 추가
             self.pose_buffer.append(feature_vector[0])
+            self.image_buffer.append(img_normalized)
             
             # 시퀀스가 충분히 쌓이지 않았으면 대기
-            if len(self.pose_buffer) < self.sequence_length:
+            if len(self.pose_buffer) < self.sequence_length or len(self.image_buffer) < self.sequence_length:
                 return {'predicted_class': 'unknown', 'confidence': 0.0}
             
-            # 시퀀스 생성
-            sequence = np.array(list(self.pose_buffer))
-            sequence_scaled = self.scaler.transform(sequence)
-            sequence_input = sequence_scaled.reshape(1, self.sequence_length, -1)
+            # 이미지 시퀀스 생성
+            img_sequence = np.array(list(self.image_buffer))
+            img_sequence = img_sequence.reshape(1, self.sequence_length, 
+                                               self.img_height, self.img_width, 3)
             
-            # 예측
-            prediction_proba = self.model.predict(sequence_input, verbose=0)[0]
+            # 수치 시퀀스 생성
+            num_sequence = np.array(list(self.pose_buffer))
+            num_sequence_scaled = self.scaler.transform(num_sequence)
+            num_sequence_input = num_sequence_scaled.reshape(1, self.sequence_length, -1)
+            
+            # 예측 (이미지 + 수치 데이터)
+            prediction_proba = self.model.predict(
+                [img_sequence, num_sequence_input], 
+                verbose=0
+            )[0]
             predicted_class_idx = np.argmax(prediction_proba)
             predicted_class = self.label_encoder.inverse_transform([predicted_class_idx])[0]
             confidence = prediction_proba[predicted_class_idx]
@@ -224,6 +243,8 @@ class RealtimePostureMonitor:
             
         except Exception as e:
             logging.error(f"예측 실패: {e}")
+            import traceback
+            traceback.print_exc()
             return {'predicted_class': 'unknown', 'confidence': 0.0}
     
     def smooth_predictions(self, prediction: dict):
@@ -343,8 +364,8 @@ class RealtimePostureMonitor:
                 pose_data = self.extract_pose_features(results.pose_landmarks, frame.shape)
                 
                 if pose_data:
-                    # 자세 예측
-                    prediction = self.predict_posture(pose_data)
+                    # 자세 예측 (이미지 + 수치 데이터)
+                    prediction = self.predict_posture(pose_data, rgb_frame)
                     self.smooth_predictions(prediction)
                     
                     # 알림 확인
@@ -374,6 +395,7 @@ class RealtimePostureMonitor:
                     break
                 elif key == ord('r'):  # R 키로 리셋
                     self.pose_buffer.clear()
+                    self.image_buffer.clear()
                     self.predictions.clear()
                     self.current_posture = "Unknown"
                     self.confidence = 0.0
