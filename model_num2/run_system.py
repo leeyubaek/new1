@@ -157,7 +157,7 @@ def run_training():
         history = cnn_lstm_model.train(
             X_img_train, X_num_train, y_train,
             X_img_val, X_num_val, y_val,
-            epochs=10,
+            epochs=40,
             batch_size=4
         )
         
