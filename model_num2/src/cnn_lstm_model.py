@@ -7,47 +7,53 @@ CNN + LSTM 하이브리드 자세 평가 모델
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
-    Input, Conv2D, MaxPooling2D, Dense, Dropout, 
-    BatchNormalization, concatenate, GlobalAveragePooling2D,
-    LSTM, TimeDistributed
-)
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.regularizers import l2
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 from sklearn.utils.class_weight import compute_class_weight
-import matplotlib.pyplot as plt
-import seaborn as sns
 from pathlib import Path
 import logging
 import joblib
 import argparse
-import cv2
-from typing import Tuple, List
+from typing import Tuple
+import os
+
+# TensorFlow GPU 최적화
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+
+# TensorFlow 병렬 처리 최적화
+tf.config.threading.set_inter_op_parallelism_threads(4)
+tf.config.threading.set_intra_op_parallelism_threads(4)
+
+# GPU가 있을 때만 Mixed Precision 활성화
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        from tensorflow.keras import mixed_precision
+        policy = mixed_precision.Policy('mixed_float16')
+        mixed_precision.set_global_policy(policy)
+        logging.info("✅ Mixed Precision (FP16) 활성화")
+    except:
+        logging.warning("Mixed Precision을 사용할 수 없습니다")
+else:
+    logging.info("CPU 모드: Mixed Precision 비활성화")
+
+# 로컬 모듈
+from model_utils import (
+    load_images_from_folder, create_sequences, split_and_augment_data
+)
+from model_builder import ModelBuilder
+from model_visualizer import evaluate_model, plot_training_history
 
 # 로깅 설정
 logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.INFO)
+
 
 class CNNLSTMModel:
     """CNN + LSTM 하이브리드 자세 분류 모델"""
     
     def __init__(self, csv_path=None, image_dir=None, model_name='cnn_lstm',
                  img_height=112, img_width=112, sequence_length=5, dropout_rate=0.35):
-        """
-        Args:
-            csv_path (str): CSV 파일 경로 (optional)
-            image_dir (str): 이미지 디렉토리 경로 (optional)
-            model_name (str): 모델 이름 (default: 'cnn_lstm')
-            img_height (int): 이미지 높이 (default: 128)
-            img_width (int): 이미지 너비 (default: 128)
-            sequence_length (int): LSTM 시퀀스 길이 (default: 5)
-            dropout_rate (float): 드롭아웃 비율 (default: 0.4)
-        """
         self.csv_path = csv_path
         self.image_dir = image_dir
         self.model_name = model_name
@@ -89,16 +95,14 @@ class CNNLSTMModel:
                 self.feature_columns.extend(coordinate_features)
                 logging.info(f"좌표 특성 {len(coordinate_features)}개 추가")
             
-            # 결측값 처리
+            # 결측값 및 unlabeled 제거
             df = df.dropna(subset=self.feature_columns + ['label'])
             logging.info(f"결측값 제거 후: {len(df)}개 샘플")
             
-            # 'unlabeled' 제거
             if 'unlabeled' in df['label'].values:
                 df = df[df['label'] != 'unlabeled']
                 logging.info(f"unlabeled 제거 후: {len(df)}개 샘플")
             
-            # 라벨 분포 확인
             label_counts = df['label'].value_counts()
             logging.info(f"라벨 분포: {dict(label_counts)}")
             
@@ -108,569 +112,80 @@ class CNNLSTMModel:
             logging.error(f"데이터 로드 실패: {e}")
             raise
     
-    def load_images_from_folder(self, image_dir: str, labels: np.ndarray) -> Tuple:
-        """폴더에서 이미지 로드 (한글 경로 지원)"""
-        image_path = Path(image_dir)
-        images = []
-        valid_indices = []
-        failed_count = 0
-        
-        logging.info(f"이미지 로드 시작: {len(labels)}개 파일")
-        
-        for idx, label in enumerate(labels):
-            label_folder = image_path / label
-            
-            # 폴더 확인
-            if not label_folder.exists():
-                if idx == 0:  # 처음에만 경고
-                    logging.warning(f"폴더가 없습니다: {label_folder}")
-                failed_count += 1
-                continue
-            
-            # 이미지 파일 찾기
-            img_files = (
-                list(label_folder.glob('*.jpg')) + 
-                list(label_folder.glob('*.JPG')) +
-                list(label_folder.glob('*.png')) + 
-                list(label_folder.glob('*.PNG')) +
-                list(label_folder.glob('*.jpeg')) +
-                list(label_folder.glob('*.JPEG'))
-            )
-            
-            if not img_files:
-                if idx == 0:
-                    logging.warning(f"{label_folder}에 이미지 파일이 없습니다")
-                failed_count += 1
-                continue
-            
-            # 인덱스에 맞는 이미지 선택
-            img_idx = idx % len(img_files)
-            img_path = img_files[img_idx]
-            
-            # 한글 경로 지원 이미지 로드
-            try:
-                # 한글 경로 처리
-                img_array = np.fromfile(str(img_path), dtype=np.uint8)
-                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-                
-                if img is None:
-                    # 일반 로드 재시도
-                    img = cv2.imread(str(img_path))
-                
-                if img is not None:
-                    # 이미지 처리
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    img = cv2.resize(img, (self.img_width, self.img_height), 
-                                   interpolation=cv2.INTER_AREA)
-                    images.append(img)
-                    valid_indices.append(idx)
-                else:
-                    failed_count += 1
-                    
-            except Exception as e:
-                logging.debug(f"이미지 로드 실패 {img_path.name}: {e}")
-                failed_count += 1
-                continue
-            
-            # 진행률 표시
-            if (idx + 1) % max(1, len(labels) // 10) == 0:
-                progress = (idx + 1) / len(labels) * 100
-                logging.info(f"진행률: {progress:.0f}% ({len(images)}/{idx+1})")
-        
-        if len(images) == 0:
-            raise ValueError(
-                f"이미지를 로드할 수 없습니다. 폴더를 확인하세요: {image_dir}\n"
-                f"필요한 폴더: {set(labels)}"
-            )
-        
-        # 정규화
-        images = np.array(images, dtype=np.float32) / 255.0
-        
-        success_rate = len(images) / len(labels) * 100
-        logging.info(
-            f"이미지 로드 완료: {len(images)}개 성공 ({success_rate:.1f}%), "
-            f"{failed_count}개 실패"
-        )
-        
-        return images, valid_indices
-    
-    def create_sequences(self, images: np.ndarray, numeric_data: np.ndarray, 
-                        labels: np.ndarray) -> Tuple:
-        """시퀀스 데이터 생성"""
-        img_sequences = []
-        num_sequences = []
-        seq_labels = []
-        
-        # 라벨별로 시퀀스 생성
-        unique_labels = np.unique(labels)
-        
-        logging.info(f"시퀀스 생성 시작 (sequence_length={self.sequence_length})")
-        
-        for label in unique_labels:
-            label_indices = np.where(labels == label)[0]
-            
-            if len(label_indices) < self.sequence_length:
-                logging.warning(
-                    f"라벨 '{label}'의 데이터가 부족합니다: "
-                    f"{len(label_indices)}개 < {self.sequence_length}개"
-                )
-                continue
-            
-            for i in range(len(label_indices) - self.sequence_length + 1):
-                indices = label_indices[i:i + self.sequence_length]
-                
-                try:
-                    img_sequences.append(images[indices])
-                    num_sequences.append(numeric_data[indices])
-                    seq_labels.append(label)
-                except IndexError as e:
-                    logging.error(f"인덱스 오류: {e}")
-                    continue
-        
-        if len(img_sequences) == 0:
-            raise ValueError(
-                f"시퀀스를 생성할 수 없습니다. "
-                f"각 라벨당 최소 {self.sequence_length}개의 데이터가 필요합니다."
-            )
-        
-        img_sequences = np.array(img_sequences)
-        num_sequences = np.array(num_sequences)
-        seq_labels = np.array(seq_labels)
-        
-        logging.info(
-            f"시퀀스 생성 완료: {len(img_sequences)}개 "
-            f"(라벨: {dict(zip(*np.unique(seq_labels, return_counts=True)))})"
-        )
-        
-        return img_sequences, num_sequences, seq_labels
-    
-    def augment_data(self, img_seqs: np.ndarray, num_seqs: np.ndarray, 
-                    labels: np.ndarray, augment_factor: int = 1, target_class: int = None) -> Tuple:
-        """
-        데이터 증강 (특정 클래스만 선택적 증강 가능)
-        
-        Args:
-            img_seqs: 이미지 시퀀스 배열
-            num_seqs: 수치 시퀀스 배열
-            labels: 라벨 배열
-            augment_factor: 증강 팩터 (default: 1)
-            target_class: 증강할 클래스 (None이면 모든 클래스)
-            
-        Returns:
-            증강된 이미지, 수치, 라벨 배열
-        """
-        aug_img_seqs = []
-        aug_num_seqs = []
-        aug_labels = []
-        
-        datagen = ImageDataGenerator(
-            rotation_range=5,
-            width_shift_range=0.05,
-            height_shift_range=0.05,
-            zoom_range=0.05,
-            fill_mode='nearest',
-            horizontal_flip=False  # 좌우 반전 비활성화 (자세 데이터 특성)
-        )
-        
-        target_msg = f"클래스 {target_class}" if target_class is not None else "모든 클래스"
-        logging.info(f"데이터 증강 시작 ({target_msg}, factor={augment_factor})")
-        
-        for i in range(len(img_seqs)):
-            current_label = labels[i]
-            
-            # 원본 항상 추가
-            aug_img_seqs.append(img_seqs[i])
-            aug_num_seqs.append(num_seqs[i])
-            aug_labels.append(labels[i])
-            
-            # 특정 클래스만 증강 (target_class가 지정된 경우)
-            if target_class is not None and current_label != target_class:
-                continue
-            
-            # 증강 데이터 생성
-            for _ in range(augment_factor):
-                aug_img_seq = []
-                
-                for frame in img_seqs[i]:
-                    # 이미지 증강
-                    img = frame.reshape((1,) + frame.shape)
-                    aug_img = datagen.flow(img, batch_size=1)[0][0]
-                    # 값 범위 유지 [0, 1]
-                    aug_img = np.clip(aug_img, 0, 1)
-                    aug_img_seq.append(aug_img)
-                
-                aug_img_seqs.append(np.array(aug_img_seq))
-                
-                # 수치 데이터 노이즈 추가
-                noise = np.random.normal(0, 0.005, num_seqs[i].shape)
-                aug_num_data = num_seqs[i] + noise
-                # 각도 범위 유지 [-180, 180]
-                aug_num_data = np.clip(aug_num_data, -180, 180)
-                aug_num_seqs.append(aug_num_data)
-                aug_labels.append(labels[i])
-            
-            # 진행률 표시
-            if (i + 1) % max(1, len(img_seqs) // 10) == 0:
-                progress = (i + 1) / len(img_seqs) * 100
-                logging.info(f"증강 진행률: {progress:.0f}%")
-        
-        aug_img_seqs = np.array(aug_img_seqs)
-        aug_num_seqs = np.array(aug_num_seqs)
-        aug_labels = np.array(aug_labels)
-        
-        # 클래스별 통계
-        unique, counts = np.unique(aug_labels, return_counts=True)
-        class_dist = dict(zip(unique, counts))
-        logging.info(f"데이터 증강 완료: {len(aug_img_seqs)}개 (클래스 분포: {class_dist})")
-        
-        return aug_img_seqs, aug_num_seqs, aug_labels
-    
-    def prepare_data(self, df: pd.DataFrame, image_dir: str, 
-                    augment: bool = True, save_split: bool = False, 
-                    output_dir: str = 'data/split_images') -> Tuple:
-        """
-        데이터 전처리 및 준비
-        
-        Args:
-            df: 데이터프레임
-            image_dir: 원본 이미지 디렉토리
-            augment: 데이터 증강 여부
-            save_split: 분할된 이미지를 폴더로 저장할지 여부
-            output_dir: 분할된 이미지 저장 디렉토리
-        """
+    def prepare_data(self, df: pd.DataFrame, image_dir: str, augment: bool = True) -> Tuple:
+        """데이터 전처리 및 준비"""
         X_numeric = df[self.feature_columns].values
         y = df['label'].values
         
         self.label_encoder = LabelEncoder()
         y_encoded = self.label_encoder.fit_transform(y)
         
-        X_images, valid_indices = self.load_images_from_folder(image_dir, y)
+        X_images, valid_indices = load_images_from_folder(
+            image_dir, y, self.img_width, self.img_height
+        )
         
         X_numeric = X_numeric[valid_indices]
         y_encoded = y_encoded[valid_indices]
-        y_labels = y[valid_indices]  # 원본 라벨도 저장
         
         self.scaler = StandardScaler()
         X_numeric_scaled = self.scaler.fit_transform(X_numeric)
         
         # 시퀀스 생성
-        X_img_seq, X_num_seq, y_seq = self.create_sequences(
-            X_images, X_numeric_scaled, y_encoded
+        X_img_seq, X_num_seq, y_seq = create_sequences(
+            X_images, X_numeric_scaled, y_encoded, self.sequence_length
         )
         
         if len(X_img_seq) == 0:
             raise ValueError("시퀀스를 생성할 수 없습니다.")
         
         # 데이터 분할 및 증강
-        result = self._split_and_augment_data(
-            X_img_seq, X_num_seq, y_seq, augment
-        )
-        
-        # 이미지 분할 저장
-        if save_split:
-            self._save_split_images(
-                X_img_seq, y_seq, output_dir, 
-                test_size=0.15, val_size=0.18
-            )
-        
-        return result
-    
-    def _save_split_images(self, X_img, y, output_dir, test_size=0.15, val_size=0.18):
-        """
-        이미지를 훈련/검증/테스트 폴더로 분할 저장
-        
-        Args:
-            X_img: 이미지 시퀀스 배열
-            y: 라벨 배열
-            output_dir: 출력 디렉토리
-            test_size: 테스트 세트 비율
-            val_size: 검증 세트 비율 (temp 기준)
-        """
-        import shutil
-        from datetime import datetime
-        
-        output_path = Path(output_dir)
-        
-        # 디렉토리 생성
-        for split in ['train', 'val', 'test']:
-            for label_name in self.label_encoder.classes_:
-                split_dir = output_path / split / label_name
-                split_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 데이터 분할 (증강 전 원본만)
-        from sklearn.model_selection import train_test_split
-        
-        # 인덱스 배열 생성
-        indices = np.arange(len(X_img))
-        
-        # Train/Temp 분할
-        idx_temp, idx_test = train_test_split(
-            indices, test_size=test_size, random_state=42, stratify=y
-        )
-        
-        # Train/Val 분할
-        y_temp = y[idx_temp]
-        idx_train, idx_val = train_test_split(
-            idx_temp, test_size=val_size, random_state=42, stratify=y_temp
-        )
-        
-        # 이미지 저장
-        splits = {
-            'train': idx_train,
-            'val': idx_val,
-            'test': idx_test
-        }
-        
-        logging.info(f"이미지 분할 저장 시작: {output_dir}")
-        
-        for split_name, indices in splits.items():
-            for idx in indices:
-                # 시퀀스의 첫 번째 프레임만 저장 (대표 이미지)
-                img = X_img[idx][0]  # 첫 번째 프레임
-                label = self.label_encoder.inverse_transform([y[idx]])[0]
-                
-                # 파일명 생성 (타임스탬프 + 인덱스)
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-                filename = f"{label}_{idx}_{timestamp}.jpg"
-                filepath = output_path / split_name / label / filename
-                
-                # 이미지 저장 (0-1 범위를 0-255로 변환)
-                img_uint8 = (img * 255).astype(np.uint8)
-                img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(str(filepath), img_bgr)
-        
-        # 통계 출력
-        logging.info(f"이미지 분할 완료:")
-        for split_name, indices in splits.items():
-            unique, counts = np.unique(y[indices], return_counts=True)
-            class_dist = {self.label_encoder.inverse_transform([u])[0]: c 
-                         for u, c in zip(unique, counts)}
-            logging.info(f"  {split_name}: {len(indices)}개 - {class_dist}")
-    
-    def _split_and_augment_data(self, X_img, X_num, y, augment):
-        """데이터 분할 및 증강 헬퍼 메서드"""
-        # Train/Temp 분할 (85/15)
-        X_img_temp, X_img_test, X_num_temp, X_num_test, y_temp, y_test = train_test_split(
-            X_img, X_num, y, test_size=0.15, random_state=42, stratify=y
-        )
-        
-        # Train/Val 분할 (70/15 from temp)
-        X_img_train, X_img_val, X_num_train, X_num_val, y_train, y_val = train_test_split(
-            X_img_temp, X_num_temp, y_temp, test_size=0.18, random_state=42, stratify=y_temp
-        )
-        
-        # 원본 데이터 개수 저장
-        original_train_count = len(X_img_train)
-        original_train_class_dist = dict(zip(*np.unique(y_train, return_counts=True)))
-        
-        logging.info(f"="*60)
-        logging.info(f"원본 데이터 분할 - 훈련: {len(X_img_train)}, 검증: {len(X_img_val)}, 테스트: {len(X_img_test)}")
-        logging.info(f"훈련 세트 클래스 분포: {original_train_class_dist}")
-        logging.info(f"="*60)
-        
-        # 훈련 데이터 증강 (모든 클래스 2배)
-        if augment and len(X_img_train) > 0:
-            # 클래스 분포 확인
-            unique, counts = np.unique(y_train, return_counts=True)
-            if len(unique) > 0:
-                # 모든 클래스 1배 증강 (과적합 방지)
-                aug_factor = 1
-                
-                logging.info(
-                    f"모든 클래스를 {aug_factor}배 증강합니다."
-                )
-                
-                # 모든 클래스 증강 (target_class=None)
-                X_img_train, X_num_train, y_train = self.augment_data(
-                    X_img_train, X_num_train, y_train, 
-                    augment_factor=aug_factor,
-                    target_class=None
-                )
-            else:
-                # 클래스가 1개만 있어도 1배 증강
-                aug_factor = 1
-                logging.info(f"단일 클래스를 {aug_factor}배 증강합니다.")
-                X_img_train, X_num_train, y_train = self.augment_data(
-                    X_img_train, X_num_train, y_train, 
-                    augment_factor=aug_factor,
-                    target_class=None
-                )
-        
-        # 증강 후 데이터 증가량 출력
-        augmented_train_count = len(X_img_train)
-        augmented_train_class_dist = dict(zip(*np.unique(y_train, return_counts=True)))
-        
-        if augment and augmented_train_count > original_train_count:
-            increase_count = augmented_train_count - original_train_count
-            increase_percent = (increase_count / original_train_count) * 100
-            
-            logging.info(f"="*60)
-            logging.info(f"✅ 데이터 증강 완료!")
-            logging.info(f"원본 훈련 데이터: {original_train_count}개")
-            logging.info(f"증강 후 훈련 데이터: {augmented_train_count}개")
-            logging.info(f"증가량: +{increase_count}개 ({increase_percent:.1f}% 증가)")
-            logging.info(f"증강 후 클래스 분포: {augmented_train_class_dist}")
-            logging.info(f"="*60)
-        
-        # 최종 분포 출력
-        total = len(X_img_train) + len(X_img_val) + len(X_img_test)
-        logging.info(
-            f"최종 분포 - 훈련: {len(X_img_train)} ({len(X_img_train)/total*100:.1f}%), "
-            f"검증: {len(X_img_val)} ({len(X_img_val)/total*100:.1f}%), "
-            f"테스트: {len(X_img_test)} ({len(X_img_test)/total*100:.1f}%)"
-        )
-        
-        return (X_img_train, X_num_train, y_train,
-                X_img_val, X_num_val, y_val,
-                X_img_test, X_num_test, y_test)
-    
-    def _build_cnn_block(self, x, filters, name_prefix):
-        """
-CNN 블록 생성 헬퍼
-        
-        Args:
-            x: 입력 텀서
-            filters: 필터 수
-            name_prefix: 레이어 이름 접두사
-            
-        Returns:
-            처리된 텀서
-        """
-        x = TimeDistributed(Conv2D(
-            filters, (3, 3), activation='relu', padding='same', 
-            kernel_regularizer=l2(0.001), name=f'{name_prefix}_conv'
-        ))(x)
-        x = TimeDistributed(BatchNormalization(momentum=0.8, name=f'{name_prefix}_bn'))(x)
-        x = TimeDistributed(MaxPooling2D((2, 2), name=f'{name_prefix}_pool'))(x)
-        x = TimeDistributed(Dropout(self.dropout_rate * 0.4, name=f'{name_prefix}_dropout'))(x)
-        return x
-    
-    def _build_lstm_block(self, x, units, return_sequences=True, name_prefix='lstm'):
-        """
-LSTM 블록 생성 헬퍼
-        
-        Args:
-            x: 입력 텀서
-            units: LSTM 유닛 수
-            return_sequences: 시퀀스 반환 여부
-            name_prefix: 레이어 이름 접두사
-            
-        Returns:
-            처리된 텀서
-        """
-        x = LSTM(
-            units, return_sequences=return_sequences,
-            dropout=self.dropout_rate, recurrent_dropout=0.2,
-            kernel_regularizer=l2(0.001), name=name_prefix
-        )(x)
-        x = BatchNormalization(momentum=0.8, name=f'{name_prefix}_bn')(x)
-        return x
+        return split_and_augment_data(X_img_seq, X_num_seq, y_seq, augment)
     
     def build_model(self, num_numeric_features: int, num_classes: int):
-        """CNN + LSTM 하이브리드 모델 구성"""
-        
-        # 이미지 브랜치
-        image_input = Input(
-            shape=(self.sequence_length, self.img_height, self.img_width, 3),
-            name='image_input'
+        """모델 구성"""
+        builder = ModelBuilder(
+            self.img_height, self.img_width, 
+            self.sequence_length, self.dropout_rate
         )
-        
-        # CNN 블록 (균형잡힌 용량: 3개)
-        x = self._build_cnn_block(image_input, 32, 'cnn1')
-        x = self._build_cnn_block(x, 64, 'cnn2')
-        x = self._build_cnn_block(x, 80, 'cnn3')
-        x = TimeDistributed(GlobalAveragePooling2D(name='gap'))(x)
-        
-        # LSTM 블록 (균형잡힌 용량)
-        x = self._build_lstm_block(x, 56, True, 'img_lstm1')
-        x = self._build_lstm_block(x, 28, False, 'img_lstm2')
-        image_features = Dense(28, activation='relu', kernel_regularizer=l2(0.0007), 
-                              name='image_features')(x)
-        
-        # 수치 브랜치
-        numeric_input = Input(
-            shape=(self.sequence_length, num_numeric_features),
-            name='numeric_input'
-        )
-        
-        y = self._build_lstm_block(numeric_input, 28, True, 'num_lstm1')
-        y = self._build_lstm_block(y, 14, False, 'num_lstm2')
-        numeric_features = Dense(14, activation='relu', kernel_regularizer=l2(0.0007),
-                                name='numeric_features')(y)
-        
-        # 융합 브랜치 (균형잡힌 용량)
-        merged = concatenate([image_features, numeric_features], name='fusion')
-        
-        z = Dense(28, activation='relu', kernel_regularizer=l2(0.0007))(merged)
-        z = BatchNormalization(momentum=0.8)(z)
-        z = Dropout(self.dropout_rate)(z)
-        z = Dense(14, activation='relu', kernel_regularizer=l2(0.0007))(z)
-        z = Dropout(self.dropout_rate * 0.8)(z)
-        
-        output = Dense(num_classes, activation='softmax', name='output')(z)
-        
-        # 모델 생성 및 컴파일
-        self.model = Model(
-            inputs=[image_input, numeric_input],
-            outputs=output,
-            name='CNN_LSTM_Posture_Model'
-        )
-        
-        self.model.compile(
-            optimizer=Adam(learning_rate=0.001, clipnorm=1.0),  # 학습률 균형 조정
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy']
-        )
-        
-        self.model.summary()
-        
+        self.model = builder.build(num_numeric_features, num_classes)
         return self.model
     
     def train(self, X_img_train, X_num_train, y_train,
               X_img_val, X_num_val, y_val,
               epochs=100, batch_size=8):
-        """
-        모델 훈련
-        
-        Args:
-            X_img_train, X_num_train, y_train: 훈련 데이터
-            X_img_val, X_num_val, y_val: 검증 데이터
-            epochs: 훈련 에폭 수
-            batch_size: 배치 크기
-            
-        Returns:
-            훈련 히스토리
-        """
+        """모델 훈련 (최적화된 버전)"""
         if self.model is None:
             raise ValueError("모델이 구성되지 않았습니다.")
         
-        # 클래스 가중치 계산 (불균형 해결)
+        # 클래스 가중치
         class_weights = compute_class_weight(
             'balanced',
             classes=np.unique(y_train),
             y=y_train
         )
-        
-        # 가중치 범위 균형 조정 (0.6 ~ 2.5)
         class_weights = np.clip(class_weights, 0.6, 2.5)
         class_weight_dict = dict(enumerate(class_weights))
         
         logging.info(f"클래스 가중치: {class_weight_dict}")
         
+        # 배치 크기 자동 최적화 (메모리 효율)
+        optimal_batch_size = self._optimize_batch_size(batch_size, len(X_img_train))
+        logging.info(f"최적화된 배치 크기: {optimal_batch_size}")
+        
         callbacks = [
             EarlyStopping(
                 monitor='val_loss', 
-                patience=18,  # patience 적절히 조정
+                patience=12,  # 더 빠른 종료
                 restore_best_weights=True,
-                min_delta=0.001,  # 임계값 적절히
+                min_delta=0.002,
                 verbose=1
             ),
             ReduceLROnPlateau(
                 monitor='val_loss', 
-                factor=0.6,
-                patience=7,
+                factor=0.5,  # 더 공격적인 학습률 감소
+                patience=5,
                 min_lr=1e-7,
-                min_delta=0.001,
+                min_delta=0.002,
                 verbose=1
             ),
             ModelCheckpoint(
@@ -681,254 +196,59 @@ LSTM 블록 생성 헬퍼
             )
         ]
         
+        # TensorFlow Dataset으로 변환 (병렬 처리 및 캐싱)
+        train_dataset = tf.data.Dataset.from_tensor_slices(
+            ({'image_input': X_img_train, 'numeric_input': X_num_train}, y_train)
+        )
+        train_dataset = train_dataset.cache()  # 메모리 캐싱
+        train_dataset = train_dataset.shuffle(buffer_size=1000)
+        train_dataset = train_dataset.batch(optimal_batch_size)
+        train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)  # 자동 프리페치
+        
+        val_dataset = tf.data.Dataset.from_tensor_slices(
+            ({'image_input': X_img_val, 'numeric_input': X_num_val}, y_val)
+        )
+        val_dataset = val_dataset.cache()
+        val_dataset = val_dataset.batch(optimal_batch_size)
+        val_dataset = val_dataset.prefetch(tf.data.AUTOTUNE)
+        
         history = self.model.fit(
-            [X_img_train, X_num_train], y_train,
-            validation_data=([X_img_val, X_num_val], y_val),
+            train_dataset,
+            validation_data=val_dataset,
             epochs=epochs,
-            batch_size=batch_size,
-            class_weight=class_weight_dict,  # 클래스 가중치 적용
+            class_weight=class_weight_dict,
             callbacks=callbacks,
             verbose=1
         )
         
         return history
     
-    def evaluate(self, X_img, X_num, y, dataset_name="Test"):
-        """
-        모델 평가 및 상세 메트릭 계산
+    def _optimize_batch_size(self, requested_batch_size, dataset_size):
+        """메모리 기반 배치 크기 최적화"""
+        # GPU 메모리 확인
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            # GPU 사용 시 더 큰 배치
+            optimal = min(requested_batch_size * 2, 32)
+        else:
+            # CPU 사용 시 적정 배치
+            optimal = min(requested_batch_size, 16)
         
-        Args:
-            X_img: 이미지 데이터
-            X_num: 수치 데이터
-            y: 실제 라벨
-            dataset_name: 데이터셋 이름 (Train/Validation/Test)
-            
-        Returns:
-            accuracy, report, confusion_matrix, metrics
-        """
+        # 데이터셋 크기에 맞춰 조정
+        return min(optimal, max(4, dataset_size // 10))
+    
+    def evaluate(self, X_img, X_num, y, dataset_name="Test"):
+        """모델 평가"""
         if self.model is None:
             raise ValueError("훈련된 모델이 없습니다.")
         
-        # 예측
-        y_pred_proba = self.model.predict([X_img, X_num], verbose=0)
-        y_pred = np.argmax(y_pred_proba, axis=1)
-        
-        # 기본 메트릭
-        accuracy = accuracy_score(y, y_pred)
-        
-        # 클래스별 메트릭 계산
-        from sklearn.metrics import precision_score, recall_score, f1_score
-        precision = precision_score(y, y_pred, average='weighted', zero_division=0)
-        recall = recall_score(y, y_pred, average='weighted', zero_division=0)
-        f1 = f1_score(y, y_pred, average='weighted', zero_division=0)
-        
-        # 결과 출력
-        logging.info(f"\n{'='*60}")
-        logging.info(f"{dataset_name} 세트 평가 결과")
-        logging.info(f"{'='*60}")
-        logging.info(f"정확도 (Accuracy):  {accuracy:.4f} ({accuracy*100:.2f}%)")
-        logging.info(f"정밀도 (Precision): {precision:.4f} ({precision*100:.2f}%)")
-        logging.info(f"재현율 (Recall):    {recall:.4f} ({recall*100:.2f}%)")
-        logging.info(f"F1 점수:          {f1:.4f} ({f1*100:.2f}%)")
-        
-        # 클래스별 성능
-        class_names = self.label_encoder.classes_
-        
-        # 클래스 순서 변경: normal을 먼저, abnormal을 나중에
-        # 원본: ['abnormal', 'normal'] -> 변경: ['normal', 'abnormal']
-        if len(class_names) == 2 and class_names[0] == 'abnormal':
-            class_names_reordered = [class_names[1], class_names[0]]  # ['normal', 'abnormal']
-            class_indices_reordered = [1, 0]
-        else:
-            class_names_reordered = class_names
-            class_indices_reordered = list(range(len(class_names)))
-        
-        report = classification_report(y, y_pred, target_names=class_names, zero_division=0)
-        logging.info(f"\n{dataset_name} 분류 보고서:\n{report}")
-        
-        # 혼동행렬 (순서 재배치)
-        cm = confusion_matrix(y, y_pred)
-        # 행렬 재배치: [0,1] -> [1,0] 순서로
-        if len(class_names) == 2 and class_names[0] == 'abnormal':
-            cm_reordered = cm[np.ix_(class_indices_reordered, class_indices_reordered)]
-        else:
-            cm_reordered = cm
-        
-        # 예측 신뢰도 분석
-        avg_confidence = np.mean(np.max(y_pred_proba, axis=1))
-        logging.info(f"평균 예측 신뢰도: {avg_confidence:.4f} ({avg_confidence*100:.2f}%)")
-        
-        # 혼동행렬 시각화 (재배치된 순서)
-        self._plot_confusion_matrix(cm_reordered, class_names_reordered, accuracy, dataset_name)
-        
-        # 클래스별 성능 시각화 (재배치된 순서)
-        self._plot_class_performance(y, y_pred, y_pred_proba, class_names_reordered, 
-                                     class_indices_reordered, dataset_name)
-        
-        # 종합 메트릭 리턴
-        metrics = {
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1_score': f1,
-            'avg_confidence': avg_confidence,
-            'confusion_matrix': cm_reordered,
-            'classification_report': report
-        }
-        
-        return accuracy, report, cm, metrics
-    
-    def _plot_confusion_matrix(self, cm, class_names, accuracy, dataset_name):
-        """혼동행렬 시각화"""
-        plt.figure(figsize=(10, 8))
-        
-        # 개수만 표시 (퍼센트 제거)
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                   xticklabels=class_names, yticklabels=class_names,
-                   cbar_kws={'label': 'Count'},
-                   linewidths=1, linecolor='gray')
-        
-        plt.title(f'{dataset_name} Confusion Matrix\nAccuracy: {accuracy:.4f}', 
-                 fontsize=14, fontweight='bold', pad=20)
-        plt.ylabel('True Label', fontsize=12, fontweight='bold')
-        plt.xlabel('Predicted Label', fontsize=12, fontweight='bold')
-        plt.tight_layout()
-        
-        # 파일 저장
-        save_path = f'models/confusion_matrix_{dataset_name.lower()}_cnn_lstm.png'
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        logging.info(f"혼동행렬 저장 완료: {save_path}")
-        
-        plt.show()
-        plt.close()
-    
-    def _plot_class_performance(self, y_true, y_pred, y_pred_proba, class_names, 
-                                class_indices, dataset_name):
-        """클래스별 성능 시각화"""
-        from sklearn.metrics import precision_recall_fscore_support
-        
-        # 클래스별 메트릭 계산 (재배치된 순서로)
-        precision, recall, f1, support = precision_recall_fscore_support(
-            y_true, y_pred, labels=class_indices, zero_division=0
+        return evaluate_model(
+            self.model, X_img, X_num, y, 
+            self.label_encoder, dataset_name
         )
-        
-        # 시각화
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-        
-        # 1. 클래스별 메트릭 비교
-        x = np.arange(len(class_names))
-        width = 0.25
-        
-        ax1.bar(x - width, precision, width, label='Precision', alpha=0.8, color='#2ecc71')
-        ax1.bar(x, recall, width, label='Recall', alpha=0.8, color='#3498db')
-        ax1.bar(x + width, f1, width, label='F1-Score', alpha=0.8, color='#e74c3c')
-        
-        ax1.set_xlabel('Class', fontsize=12, fontweight='bold')
-        ax1.set_ylabel('Score', fontsize=12, fontweight='bold')
-        ax1.set_title(f'{dataset_name} Class Performance Metrics', fontsize=14, fontweight='bold')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(class_names, rotation=45, ha='right')
-        ax1.legend(fontsize=10)
-        ax1.set_ylim([0, 1.1])
-        ax1.grid(True, alpha=0.3, axis='y')
-        
-        # 값 표시
-        for i, (p, r, f) in enumerate(zip(precision, recall, f1)):
-            ax1.text(i - width, p + 0.02, f'{p:.2f}', ha='center', va='bottom', fontsize=8)
-            ax1.text(i, r + 0.02, f'{r:.2f}', ha='center', va='bottom', fontsize=8)
-            ax1.text(i + width, f + 0.02, f'{f:.2f}', ha='center', va='bottom', fontsize=8)
-        
-        # 2. 클래스별 샘플 수 및 예측 신뢰도
-        avg_confidence_per_class = []
-        for orig_idx in class_indices:
-            mask = y_true == orig_idx
-            if mask.sum() > 0:
-                avg_conf = np.mean(np.max(y_pred_proba[mask], axis=1))
-                avg_confidence_per_class.append(avg_conf)
-            else:
-                avg_confidence_per_class.append(0)
-        
-        ax2_twin = ax2.twinx()
-        
-        bars = ax2.bar(x, support, alpha=0.6, color='#9b59b6', label='Sample Count')
-        line = ax2_twin.plot(x, avg_confidence_per_class, 'o-', color='#e67e22', 
-                            linewidth=2, markersize=8, label='Avg Confidence')
-        
-        ax2.set_xlabel('Class', fontsize=12, fontweight='bold')
-        ax2.set_ylabel('Sample Count', fontsize=12, fontweight='bold', color='#9b59b6')
-        ax2_twin.set_ylabel('Average Confidence', fontsize=12, fontweight='bold', color='#e67e22')
-        ax2.set_title(f'{dataset_name} Sample Distribution & Confidence', fontsize=14, fontweight='bold')
-        ax2.set_xticks(x)
-        ax2.set_xticklabels(class_names, rotation=45, ha='right')
-        ax2.tick_params(axis='y', labelcolor='#9b59b6')
-        ax2_twin.tick_params(axis='y', labelcolor='#e67e22')
-        ax2_twin.set_ylim([0, 1.1])
-        ax2.grid(True, alpha=0.3, axis='y')
-        
-        # 레전드 통합
-        lines1, labels1 = ax2.get_legend_handles_labels()
-        lines2, labels2 = ax2_twin.get_legend_handles_labels()
-        ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=10)
-        
-        # 값 표시
-        for i, (s, c) in enumerate(zip(support, avg_confidence_per_class)):
-            ax2.text(i, s + max(support) * 0.02, str(s), ha='center', va='bottom', fontsize=9)
-            ax2_twin.text(i, c + 0.03, f'{c:.2f}', ha='center', va='bottom', fontsize=8, color='#e67e22')
-        
-        plt.tight_layout()
-        
-        # 저장
-        save_path = f'models/class_performance_{dataset_name.lower()}_cnn_lstm.png'
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        logging.info(f"클래스 성능 분서 저장 완료: {save_path}")
-        
-        plt.show()
-        plt.close()
-    
-    def plot_training_history(self, history):
-        """
-        훈련 히스토리 시각화
-        
-        Args:
-            history: 모델 훈련 히스토리
-        """
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-        
-        # 에포크 수
-        epochs = range(1, len(history.history['accuracy']) + 1)
-        
-        # 정확도 그래프
-        ax1.plot(epochs, history.history['accuracy'], 'b-', label='Training Accuracy', linewidth=2, marker='o', markersize=3)
-        ax1.plot(epochs, history.history['val_accuracy'], 'r-', label='Validation Accuracy', linewidth=2, marker='s', markersize=3)
-        ax1.set_title('Model Accuracy', fontsize=14, fontweight='bold')
-        ax1.set_xlabel('Epoch', fontsize=12)
-        ax1.set_ylabel('Accuracy', fontsize=12)
-        ax1.legend(fontsize=10, loc='lower right')
-        ax1.grid(True, alpha=0.3)
-        ax1.set_ylim([0, 1.0])
-        
-        # 손실률 그래프
-        ax2.plot(epochs, history.history['loss'], 'b-', label='Training Loss', linewidth=2, marker='o', markersize=3)
-        ax2.plot(epochs, history.history['val_loss'], 'r-', label='Validation Loss', linewidth=2, marker='s', markersize=3)
-        ax2.set_title('Model Loss', fontsize=14, fontweight='bold')
-        ax2.set_xlabel('Epoch', fontsize=12)
-        ax2.set_ylabel('Loss', fontsize=12)
-        ax2.legend(fontsize=10, loc='upper right')
-        ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig('models/training_history_cnn_lstm.png', dpi=300, bbox_inches='tight')
-        logging.info("훈련 히스토리 그래프 저장 완료: models/training_history_cnn_lstm.png")
-        plt.show()
-        plt.close()
     
     def save_model(self, model_path: str = 'models/cnn_lstm_model.h5'):
-        """
-        모델 및 전처리 객체 저장
-        
-        Args:
-            model_path: 모델 저장 경로
-        """
+        """모델 및 전처리 객체 저장"""
         if self.model is None:
             raise ValueError("저장할 모델이 없습니다.")
         
@@ -959,19 +279,15 @@ def main():
     parser.add_argument('--images', default='data/train_images',
                        help='이미지 폴더 경로')
     parser.add_argument('--epochs', type=int, default=35,
-                       help='훈련 에폭 수 (기본: 35, 빠른 테스트: 20)')
-    parser.add_argument('--batch_size', type=int, default=14,
-                       help='배치 크기 (기본: 14, GPU 메모리 부족 시 10으로 감소)')
+                       help='훈련 에폭 수')
+    parser.add_argument('--batch_size', type=int, default=16,
+                       help='배치 크기 (자동 최적화됨)')
     parser.add_argument('--img_size', type=int, default=112,
-                       help='이미지 크기 (기본: 112, 고성능: 128, 경량: 96)')
+                       help='이미지 크기')
     parser.add_argument('--sequence_length', type=int, default=5,
                        help='LSTM 시퀀스 길이')
     parser.add_argument('--no_augment', action='store_true',
                        help='데이터 증강 사용 안 함')
-    parser.add_argument('--save_split', action='store_true',
-                       help='훈련/검증/테스트 이미지를 폴더로 분할 저장')
-    parser.add_argument('--output_dir', type=str, default='data/split_images',
-                       help='분할된 이미지 저장 디렉토리')
     
     args = parser.parse_args()
     
@@ -995,10 +311,7 @@ def main():
         (X_img_train, X_num_train, y_train,
          X_img_val, X_num_val, y_val,
          X_img_test, X_num_test, y_test) = model.prepare_data(
-            df, image_dir, 
-            augment=not args.no_augment,
-            save_split=args.save_split,
-            output_dir=args.output_dir
+            df, image_dir, augment=not args.no_augment
         )
         
         if len(X_img_train) == 0:
@@ -1019,21 +332,22 @@ def main():
             batch_size=args.batch_size
         )
         
-        model.plot_training_history(history)
+        plot_training_history(history)
         
-        logging.info("훈련 세트 평가 중...")
-        train_accuracy, train_report, train_cm, train_metrics = model.evaluate(
-            X_img_train, X_num_train, y_train, dataset_name="Train"
+        # 평가
+        logging.info("훈련 세트 평가...")
+        train_accuracy, _, _, train_metrics = model.evaluate(
+            X_img_train, X_num_train, y_train, "Train"
         )
         
-        logging.info("검증 세트 평가 중...")
-        val_accuracy, val_report, val_cm, val_metrics = model.evaluate(
-            X_img_val, X_num_val, y_val, dataset_name="Validation"
+        logging.info("검증 세트 평가...")
+        val_accuracy, _, _, val_metrics = model.evaluate(
+            X_img_val, X_num_val, y_val, "Validation"
         )
         
-        logging.info("테스트 세트 평가 중...")
-        test_accuracy, test_report, test_cm, test_metrics = model.evaluate(
-            X_img_test, X_num_test, y_test, dataset_name="Test"
+        logging.info("테스트 세트 평가...")
+        test_accuracy, _, _, test_metrics = model.evaluate(
+            X_img_test, X_num_test, y_test, "Test"
         )
         
         logging.info("모델 저장 중...")
@@ -1044,31 +358,19 @@ def main():
         logging.info("CNN + LSTM 모델 훈련 완료!")
         logging.info("="*70)
         
-        logging.info("\n[훈련 세트 결과]")
-        logging.info(f"  정확도: {train_accuracy:.4f} ({train_accuracy*100:.2f}%)")
-        logging.info(f"  Precision: {train_metrics['precision']:.4f}")
-        logging.info(f"  Recall: {train_metrics['recall']:.4f}")
-        logging.info(f"  F1-Score: {train_metrics['f1_score']:.4f}")
-        
-        logging.info("\n[검증 세트 결과]")
-        logging.info(f"  정확도: {val_accuracy:.4f} ({val_accuracy*100:.2f}%)")
-        logging.info(f"  Precision: {val_metrics['precision']:.4f}")
-        logging.info(f"  Recall: {val_metrics['recall']:.4f}")
-        logging.info(f"  F1-Score: {val_metrics['f1_score']:.4f}")
-        
-        logging.info("\n[테스트 세트 결과] ⭐")
-        logging.info(f"  정확도: {test_accuracy:.4f} ({test_accuracy*100:.2f}%)")
-        logging.info(f"  Precision: {test_metrics['precision']:.4f}")
-        logging.info(f"  Recall: {test_metrics['recall']:.4f}")
-        logging.info(f"  F1-Score: {test_metrics['f1_score']:.4f}")
-        logging.info(f"  평균 신뢰도: {test_metrics['avg_confidence']:.4f}")
+        logging.info("\n[훈련 세트] 정확도: {:.4f} ({:.2f}%)".format(
+            train_accuracy, train_accuracy*100))
+        logging.info("[검증 세트] 정확도: {:.4f} ({:.2f}%)".format(
+            val_accuracy, val_accuracy*100))
+        logging.info("[테스트 세트] 정확도: {:.4f} ({:.2f}%) ⭐".format(
+            test_accuracy, test_accuracy*100))
         
         # 과적합 검사
         overfitting_gap = train_accuracy - val_accuracy
         if overfitting_gap > 0.1:
-            logging.warning(f"\n⚠️  과적합 가능성: 훈련-검증 정확도 차이 {overfitting_gap:.4f}")
+            logging.warning(f"\n⚠️  과적합 가능성: {overfitting_gap:.4f}")
         else:
-            logging.info(f"\n✅ 좋은 일반화 성능: 훈련-검증 정확도 차이 {overfitting_gap:.4f}")
+            logging.info(f"\n✅ 좋은 일반화 성능: {overfitting_gap:.4f}")
         
         logging.info("\n" + "="*70)
         

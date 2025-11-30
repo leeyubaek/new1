@@ -111,7 +111,7 @@ class PosePreprocessor:
             return None
     
     def calculate_angles(self, pose_data: Dict) -> Dict:
-        """자세 각도 계산 (개선된 버전)"""
+        """자세 각도 계산 (절대값 기반 - 좌우 위치 무관)"""
         angles = {}
         
         try:
@@ -126,41 +126,39 @@ class PosePreprocessor:
             shoulder_center_x = (left_shoulder_x + right_shoulder_x) / 2
             shoulder_center_y = (left_shoulder_y + right_shoulder_y) / 2
             
-            # 목 기울기 각도
-            neck_angle = np.degrees(np.arctan2(
-                nose_x - shoulder_center_x,
-                shoulder_center_y - nose_y
-            ))
-            angles['neck_angle'] = self._normalize_angle(neck_angle)
+            # 목 기울기: y축 차이만 고려 (수직 방향 기울기)
+            y_diff = shoulder_center_y - nose_y
+            x_diff_abs = abs(nose_x - shoulder_center_x)
+            neck_angle = np.degrees(np.arctan2(x_diff_abs, y_diff))
+            angles['neck_angle'] = neck_angle
             
-            # 어깨 기울기 각도
-            shoulder_angle = np.degrees(np.arctan2(
+            # 어깨 기울기: 절대값으로 좌우 대칭 처리
+            shoulder_angle = abs(np.degrees(np.arctan2(
                 right_shoulder_y - left_shoulder_y,
                 right_shoulder_x - left_shoulder_x
-            ))
-            angles['shoulder_angle'] = self._normalize_angle(shoulder_angle)
+            )))
+            angles['shoulder_angle'] = shoulder_angle
             
-            # 허리 기울기 각도
+            # 허리 기울기: 절대값으로 좌우 대칭 처리
             left_hip_x = pose_data['left_hip_x']
             left_hip_y = pose_data['left_hip_y']
             right_hip_x = pose_data['right_hip_x']
             right_hip_y = pose_data['right_hip_y']
             
-            hip_angle = np.degrees(np.arctan2(
+            hip_angle = abs(np.degrees(np.arctan2(
                 right_hip_y - left_hip_y,
                 right_hip_x - left_hip_x
-            ))
-            angles['hip_angle'] = self._normalize_angle(hip_angle)
+            )))
+            angles['hip_angle'] = hip_angle
             
-            # 상체 전체 기울기 (어깨 중심 - 허리 중심)
+            # 상체 전체 기울기: y축 차이만 고려 (수직 방향 기울기)
             hip_center_x = (left_hip_x + right_hip_x) / 2
             hip_center_y = (left_hip_y + right_hip_y) / 2
             
-            torso_angle = np.degrees(np.arctan2(
-                shoulder_center_x - hip_center_x,
-                hip_center_y - shoulder_center_y
-            ))
-            angles['torso_angle'] = self._normalize_angle(torso_angle)
+            y_diff = hip_center_y - shoulder_center_y
+            x_diff_abs = abs(shoulder_center_x - hip_center_x)
+            torso_angle = np.degrees(np.arctan2(x_diff_abs, y_diff))
+            angles['torso_angle'] = torso_angle
             
         except Exception as e:
             logging.error(f"각도 계산 실패: {e}")
